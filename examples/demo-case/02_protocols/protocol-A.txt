@@ -1,0 +1,8 @@
+Protocol A: Flow Cytometry
+
+Section 1 Instrument setup
+The flow cytometer was calibrated with calibration beads before each run.
+Laser power and gain settings were recorded in the instrument log.
+
+Section 2 Sample preparation
+Samples were diluted to 1e6 cells per mL and stained with the antibody mix.
