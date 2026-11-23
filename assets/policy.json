@@ -1,0 +1,39 @@
+{
+  "version": "1.0.0",
+  "scoring": {
+    "k1": 1.2,
+    "b": 0.75,
+    "min_score": 0.45,
+    "top_k": 8,
+    "cjk_bigram_weight": 1.8,
+    "cjk_unigram_weight": 0.45,
+    "ascii_weight": 1.0,
+    "numeric_weight": 0.8,
+    "phrase_boost": 1.5,
+    "section_boost": 0.8,
+    "filename_boost": 0.3,
+    "max_section_boost_terms": 3
+  },
+  "caps": {
+    "max_files": 2000,
+    "max_file_bytes": 4000000,
+    "max_text_chars": 2000000,
+    "max_total_chars": 20000000,
+    "max_passages": 200000,
+    "max_queries": 20,
+    "passage_chars": 900,
+    "quote_chars": 320,
+    "context_chars": 80
+  },
+  "filters": {
+    "section_match": "case_insensitive_substring_or_glob",
+    "unmatched_policy": "report_and_do_not_relax",
+    "year_sources": ["filename", "text", "metadata", "file_metadata"]
+  },
+  "status": {
+    "success": "all queries covered, no unmatched filter, no indexing failure",
+    "partial": "some query/filter/file failed but index and evidence remain usable",
+    "insufficient_input": "case.json missing or no readable text indexed",
+    "failed": "case.json unreadable or invalid"
+  }
+}
