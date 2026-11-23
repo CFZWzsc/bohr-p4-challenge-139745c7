@@ -1,0 +1,34 @@
+{
+  "case_id": "demo-buffer-recipe",
+  "queries": [
+    {
+      "id": "q1",
+      "query": "buffer recipe Tris NaCl pH",
+      "filters": {
+        "year": "2021"
+      }
+    },
+    {
+      "id": "q2",
+      "query": "flow cytometer calibration",
+      "filters": {
+        "section": "Appendix Z"
+      }
+    }
+  ],
+  "filters": {
+    "ext": ["md", "txt", "csv", "html"]
+  },
+  "required_fields": ["hits", "evidence", "misses"],
+  "output_contract": {
+    "case_id": "string",
+    "results": "array of ranked passage hits",
+    "citations": "array of hit ids usable as citations",
+    "sources": "array of file-level evidence records",
+    "missed": "array of uncovered queries or filters",
+    "index": "object with file and passage statistics",
+    "notes": "array of uncertainty and limitation notes",
+    "summary": "short string",
+    "status": "one of success/partial/insufficient_input/failed"
+  }
+}
