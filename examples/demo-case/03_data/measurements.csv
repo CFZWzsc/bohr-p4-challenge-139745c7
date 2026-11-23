@@ -1,0 +1,5 @@
+sample_id,date,value,unit
+S01,2021-03-02,7.4,pH
+S02,2021-03-02,150,mM NaCl
+S03,2022-04-11,7.2,pH
+S04,2022-04-11,200,mM NaCl
