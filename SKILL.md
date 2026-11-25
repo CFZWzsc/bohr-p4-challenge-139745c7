@@ -79,6 +79,9 @@ python3 /skills/weekly-skill/scripts/run_skill.py --input /input --work /app/wor
 | `run_log` | 确定性运行步骤与状态判定原因（无时间戳） |
 | `summary` | 一句话摘要（字符串） |
 | `skipped` / `duplicates` | 跳过文件与重复内容记录 |
+| `applied_filters` | 逐查询实际执行的过滤：filter、before、after、excluded、必要时 unsatisfied_reason |
+| `conflict_groups` | 同一查询内同一量出现不同数值的冲突组（values/files/quotes），无冲突为 `[]` |
+| `versions` | 识别出的版本文件：`version_label` 与被替代文件 `supersedes` |
 | `contract_extras` | `output_contract` 每个字段的映射方式与未知字段清单 |
 
 `output_contract` 的每个键都会出现在顶层。别名映射：`results` / `matches` / `citations` / `retrievals` → `hits`；`sources` / `refs` → `evidence`；`missed` / `uncovered` → `misses`；`state` / `index` → `index_stats`；`notes` → `uncertainty`；`summary` → 短字符串。无法识别的键按字段名做最佳尽力投影（结构化对象 + `contract_extras` 记录），不会留空或写 `pending`。
@@ -118,12 +121,14 @@ python3 /skills/weekly-skill/scripts/run_skill.py --input /input --work /app/wor
 - 文本文件：`locator.kind="line"`，`line_start/line_end` 为 1 起算的原始行号，`char_start/char_end` 为抽取文本中的字符偏移。
 - PDF：`locator.kind="page"`，`page` 为启发式物理页，`char_start/char_end` 为抽取文本偏移；`confidence="low"`，不作为精确印刷页码声明。
 - 每条 hit 在 `evidence` 中有同 `evidence_id` 的记录，含文件 `sha256`、抽取器、编码、`quote_sha256`，便于他人复跑核对。
+- 年份过滤生效时，hit 带 `year_status`（`known`/`unknown`）与 `year`；版本文件 hit 带 `version_label` 与 `supersedes`。
 - 复核方法：打开 `file`，跳到 `line_start`（或 `page`）逐字比对 `quote`；不一致即视为该命中不可用，必须在 `run-review.md` 中如实记录。
 
 ## 过滤与排序口径
 
 - 过滤器是硬约束，先作用于文件（`ext`/`file_type`/`format`、`year`、`author`、`project`/`project_id`、`batch`、`version`、`path`/`glob`），再对命中应用 `section` 过滤。
-- `year` 支持列表与 `{"gte","lte","eq"}` 区间；年份来自文件名、正文与 `case.json` 的 `metadata`/`file_metadata`。
+- `year` 支持列表与 `{"gte","lte","eq"}` 区间；年份仅取自路径/文件名、front matter/meta 的 `year`/`date`、HTML `<meta>` date/time 与 CSV 逐行 date 列，正文里散落的年份不作为文档年份。
+- `year` 是硬约束：已知年份不符的文件整篇排除，CSV 按行 date 过滤；无年份信息的文件保留召回，但每条 hit 标记 `year_status: "unknown"`，结果写入 `applied_filters`（before/after/excluded/unsatisfied_reason）。
 - 文件类型别名：`pdf`、`markdown`、`text`、`data`、`json`、`csv`、`xml`、`html` 等映射到扩展名集合；未知类型按扩展名精确匹配。
 - 任一过滤步骤把候选集变为空时：返回空命中，并在 `misses` 写入 `filter_unmatched` / `filters_excluded_all_files` / `section_filter_excluded_all_hits`，**不放宽条件、不猜测命中**。
 - 排序只使用分数与确定性键；不做跨查询合并去重，保留每个查询各自的 top-k；同内容文件按哈希识别，重复副本不重复计入排名。
