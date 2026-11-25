@@ -26,6 +26,7 @@ answers, private data or credentials are included.
 | `examples/quickstart.md` |
 | `references/evidence-locators.md` |
 | `references/failure-modes.md` |
+| `references/gain-ablation.md` |
 | `references/retrieval-protocol.md` |
 | `scripts/run_skill.py` |
 | `scripts/sk_entry.py` |
