@@ -85,6 +85,16 @@ CJK_STOP = set("的了在是和与及中对为等请找出说明什么哪些如�
 ASCII_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_\-]*")
 CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 YEAR_RE = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+META_LINE_RE = re.compile(
+    r"^([A-Za-z_][\w\-]{0,30}|[\u4e00-\u9fff]{1,8})\s*[:：]\s*(.{1,200})$")
+HTML_META_RE = re.compile(r"(?is)<meta\b[^>]*>")
+HTML_ATTR_RE = re.compile(r"""(?is)([a-zA-Z:_-]+)\s*=\s*["']([^"']*)["']""")
+CSV_DATE_COLUMNS = {
+    "date", "datetime", "date_time", "time", "timestamp", "day", "recorded",
+    "recorded_at", "acquired", "acquired_at", "measurement_date",
+}
+VERSION_NAME_RE = re.compile(r"(?i)(revision|rev\d+|supersede[sd]?|superseded|version)")
+YEAR_KEY_NAMES = {"year", "years", "date"}
 CAPTION_RE = re.compile(r"(?i)^(table|figure|fig\.?|图|表)\s*\d+")
 AUTHOR_RE = re.compile(r"(?im)^\s*(?:authors?|作者|撰写|written by)\s*[:：]\s*(.{2,200})$")
 
@@ -156,6 +166,14 @@ CANONICAL_ALIASES = {
 
 def sha256_bytes(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def safe_error(exc):
+    """Short exception text with host absolute paths removed."""
+    message = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+    message = re.sub(r"""['"][A-Za-z]:[\\/][^'"]*['"]""", "<path>", message)
+    message = re.sub(r"""['"]/(?:[^'"]*/)+[^'"]*['"]""", "<path>", message)
+    return "%s: %s" % (type(exc).__name__, message)
 
 
 def norm_key(name):
@@ -509,10 +527,11 @@ def walk_files(root, policy):
     cap = int(policy["caps"].get("max_files", 2000))
 
     def onerror(exc):
+        name = getattr(exc, "filename", None)
         skipped.append({
-            "path": str(getattr(exc, "filename", root)),
+            "path": Path(str(name)).name if name else ".",
             "reason": "walk_error",
-            "detail": exc.strerror if getattr(exc, "strerror", None) else str(exc),
+            "detail": safe_error(exc),
         })
 
     for dirpath, dirnames, filenames in os.walk(str(root), topdown=True, onerror=onerror):
@@ -583,6 +602,280 @@ def extract_authors(text):
     return authors[:5]
 
 
+def front_matter_fields(text):
+    """YAML front matter key/value pairs at the very top of a text document."""
+    fields = {}
+    if not text.startswith("---"):
+        return fields
+    end = text.find("\n---", 3)
+    if end < 0:
+        return fields
+    for line in text[3:end].splitlines():
+        match = META_LINE_RE.match(line.strip())
+        if match:
+            fields.setdefault(match.group(1).lower(), match.group(2).strip())
+    return fields
+
+
+def header_meta_fields(text, max_lines=60):
+    """Anchored `key: value` metadata lines in the document header.
+
+    Only whole metadata lines are read; years that merely occur inside prose
+    never match because the line must start with a field name and a colon.
+    """
+    fields = {}
+    for index, line in enumerate(text.splitlines()):
+        if index >= max_lines:
+            break
+        stripped = line.strip()
+        if not stripped or HEADING_MD.match(stripped):
+            continue
+        match = META_LINE_RE.match(stripped)
+        if match:
+            fields.setdefault(match.group(1).lower(), match.group(2).strip())
+    return fields
+
+
+def html_meta_fields(raw_text):
+    fields = {}
+    for tag in HTML_META_RE.findall(raw_text or ""):
+        attrs = {}
+        for key, value in HTML_ATTR_RE.findall(tag):
+            attrs[key.lower()] = value
+        name = (attrs.get("name") or attrs.get("property") or
+                attrs.get("itemprop") or attrs.get("http-equiv") or "").lower()
+        content = attrs.get("content", "")
+        if content and ("date" in name or "time" in name or "year" in name):
+            fields.setdefault(name, content)
+    for match in re.finditer(r"(?is)<time\b[^>]*datetime\s*=\s*[\"']([^\"']+)[\"']", raw_text or ""):
+        fields.setdefault("time:datetime", match.group(1))
+    return fields
+
+
+def parse_csv_info(text, ext):
+    """Return header/date-column information and per-line date values for CSV."""
+    lines = text.splitlines()
+    header_line = None
+    header = ""
+    for index, line in enumerate(lines, start=1):
+        if line.strip():
+            header_line, header = index, line
+            break
+    if header_line is None:
+        return None
+    if ext == ".tsv":
+        delimiter = "\t"
+    elif header.count("\t") > header.count(","):
+        delimiter = "\t"
+    elif header.count(";") > header.count(","):
+        delimiter = ";"
+    else:
+        delimiter = ","
+    columns = [cell.strip().strip("\"'").lower() for cell in header.split(delimiter)]
+    date_index = None
+    for index, name in enumerate(columns):
+        if norm_key(name) in CSV_DATE_COLUMNS:
+            date_index = index
+            break
+    if date_index is None:
+        for index, name in enumerate(columns):
+            key = norm_key(name)
+            if "date" in key or "日期" in name or "time" in key:
+                date_index = index
+                break
+    rows = {}
+    for line_no, line in enumerate(lines, start=1):
+        if line_no <= header_line or not line.strip():
+            continue
+        info = {"year": None, "date": None}
+        if date_index is not None:
+            cells = line.split(delimiter)
+            if date_index < len(cells):
+                cell = cells[date_index].strip().strip("\"'")
+                info["date"] = cell
+                match = YEAR_RE.search(cell)
+                if match:
+                    info["year"] = match.group(0)
+        rows[line_no] = info
+    return {
+        "delimiter": delimiter,
+        "columns": columns,
+        "date_column": columns[date_index] if date_index is not None else None,
+        "date_index": date_index,
+        "has_date_column": date_index is not None,
+        "rows": rows,
+    }
+
+
+def collect_doc_years(rel, text, ext, metadata, raw_text):
+    """Authoritative document years only.
+
+    Sources: path/filename, YAML front matter, anchored header meta fields,
+    HTML <meta> date/time tags, case.json metadata, and CSV date-column rows.
+    Years occurring in running prose are deliberately ignored.
+    """
+    years, sources = set(), []
+
+    def add(source, value):
+        for year in YEAR_RE.findall(str(value)):
+            years.add(year)
+            sources.append({"source": source, "value": year})
+
+    add("path", rel)
+    front = front_matter_fields(text)
+    for key in ("year", "date", "published", "created", "updated",
+                "publication_date", "pub_year"):
+        if key in front:
+            add("front_matter:" + key, front[key])
+    header = header_meta_fields(text)
+    for key, value in header.items():
+        if key in ("year", "date", "published", "created", "updated",
+                   "年份", "日期", "发表时间", "收稿日期"):
+            add("meta:" + key, value)
+    if ext in (".html", ".htm"):
+        for key, value in html_meta_fields(raw_text).items():
+            add("html_meta:" + key, value)
+    for meta_key, meta_value in metadata.items():
+        key = norm_key(meta_key)
+        if key in ("year", "date", "published", "created", "updated", "pub_year"):
+            add("metadata:" + key, meta_value)
+    return sorted(years), sources
+
+
+def year_allowed(spec, year):
+    """True when a single year value satisfies a scalar/list/range filter."""
+    try:
+        number = int(year)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(spec, dict):
+        equals = spec.get("eq", spec.get("equals"))
+        if equals is not None:
+            try:
+                if int(equals) != number:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        low = spec.get("gte", spec.get("min"))
+        high = spec.get("lte", spec.get("max"))
+        low_strict = spec.get("gt")
+        high_strict = spec.get("lt")
+        if low is not None:
+            try:
+                if number < int(low):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if high is not None:
+            try:
+                if number > int(high):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if low_strict is not None:
+            try:
+                if number <= int(low_strict):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if high_strict is not None:
+            try:
+                if number >= int(high_strict):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+    values = filter_values(spec)
+    if not values:
+        return True
+    for value in values:
+        try:
+            if int(value) == number:
+                return True
+        except (TypeError, ValueError):
+            if str(value) == str(year):
+                return True
+    return False
+
+
+def is_year_key(key):
+    return norm_key(key) in YEAR_KEY_NAMES
+
+
+def years_satisfy(years, specs):
+    if not specs:
+        return True
+    return all(any(year_allowed(spec, year) for year in years) for spec in specs)
+
+
+def version_label_for(rel, metadata):
+    for meta_key, meta_value in metadata.items():
+        if norm_key(meta_key) in ("version", "revision", "version_label"):
+            value = str(meta_value).strip()
+            if value:
+                return value
+    stem = Path(rel).stem
+    if VERSION_NAME_RE.search(stem):
+        return re.sub(r"[_\s]+", "-", stem).strip("-")
+    return None
+
+
+def share_token_count(left, right):
+    left_tokens = set(token for token in analyze(left[:20000]) if not token.isdigit())
+    right_tokens = set(token for token in analyze(right[:20000]) if not token.isdigit())
+    return len(left_tokens & right_tokens)
+
+
+def annotate_versions(unique_docs):
+    """Attach version_label / supersedes using file name, metadata and content."""
+    by_file = {doc["file"]: doc for doc in unique_docs}
+    for doc in unique_docs:
+        metadata = doc.get("metadata") or {}
+        label = version_label_for(doc["file"], metadata)
+        doc["version_label"] = label
+        doc["supersedes"] = None
+        if not label:
+            continue
+        explicit = None
+        for meta_key, meta_value in metadata.items():
+            if norm_key(meta_key) in ("supersedes", "superseded", "replaced",
+                                      "replaces", "supersedes_file"):
+                candidate = str(meta_value).strip().replace("\\", "/")
+                if candidate in by_file:
+                    explicit = candidate
+                    break
+                base = Path(candidate).name
+                for other in unique_docs:
+                    if other is not doc and Path(other["file"]).name == base:
+                        explicit = other["file"]
+                        break
+                if explicit:
+                    break
+        if explicit:
+            doc["supersedes"] = explicit
+            continue
+        own_years = [int(year) for year in doc["years"]]
+        if not own_years:
+            continue
+        own_parent = Path(doc["file"]).parent
+        best = None
+        for other in unique_docs:
+            if other is doc or Path(other["file"]).parent != own_parent:
+                continue
+            older = [int(year) for year in other["years"] if int(year) < max(own_years)]
+            if not older:
+                continue
+            shared = share_token_count(doc["text"], other["text"])
+            if shared < 2:
+                continue
+            candidate = (max(older), shared, other["file"])
+            if best is None or (-candidate[0], -candidate[1], candidate[2]) < (
+                    -best[0], -best[1], best[2]):
+                best = candidate
+        if best:
+            doc["supersedes"] = best[2]
+
+
 def load_documents(files, exclude_keys, metadata_map, policy):
     docs, skipped, duplicates = [], [], []
     caps = policy["caps"]
@@ -603,7 +896,8 @@ def load_documents(files, exclude_keys, metadata_map, policy):
         try:
             stat = path.stat()
         except OSError as exc:
-            skipped.append({"path": rel, "reason": "stat_error", "detail": str(exc)})
+            skipped.append({"path": rel, "reason": "stat_error",
+                            "detail": safe_error(exc)})
             continue
         if stat.st_size == 0:
             skipped.append({"path": rel, "reason": "empty_file"})
@@ -612,7 +906,8 @@ def load_documents(files, exclude_keys, metadata_map, policy):
             with open(str(path), "rb") as fh:
                 data = fh.read(max_bytes + 1)
         except OSError as exc:
-            skipped.append({"path": rel, "reason": "unreadable", "detail": str(exc)})
+            skipped.append({"path": rel, "reason": "unreadable",
+                            "detail": safe_error(exc)})
             continue
         truncated = len(data) > max_bytes
         data = data[:max_bytes]
@@ -623,7 +918,7 @@ def load_documents(files, exclude_keys, metadata_map, policy):
             text, extractor, encoding, confidence = extract_text(data, ext)
         except Exception as exc:  # extraction must never abort the run
             skipped.append({"path": rel, "reason": "extract_error",
-                            "detail": "%s: %s" % (type(exc).__name__, exc)})
+                            "detail": safe_error(exc)})
             continue
         if not text or not text.strip():
             reason = "no_text_layer" if ext in PDF_EXTS else "no_extractable_text"
@@ -631,7 +926,22 @@ def load_documents(files, exclude_keys, metadata_map, policy):
             continue
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         text = text[:max_chars]
-        years = sorted(set(YEAR_RE.findall(text)) | set(YEAR_RE.findall(rel)))
+        metadata = lookup_metadata(metadata_map, rel)
+        raw_text = text
+        if ext in (".html", ".htm"):
+            try:
+                raw_text = decode_text_bytes(data)[0].replace("\r\n", "\n").replace("\r", "\n")
+            except Exception:
+                raw_text = text
+        years, year_sources = collect_doc_years(rel, text, ext, metadata, raw_text)
+        csv_info = parse_csv_info(text, ext) if ext in (".csv", ".tsv") else None
+        if csv_info:
+            for line_no in sorted(csv_info["rows"]):
+                row_year = csv_info["rows"][line_no]["year"]
+                if row_year:
+                    years.append(row_year)
+                    year_sources.append({"source": "csv_date", "value": row_year})
+            years = sorted(set(years))
         doc = {
             "file": rel,
             "ext": ext,
@@ -646,8 +956,13 @@ def load_documents(files, exclude_keys, metadata_map, policy):
             "encoding": encoding,
             "confidence": confidence,
             "years": years,
+            "year_sources": year_sources,
+            "year_status": "known" if years else "unknown",
+            "csv": csv_info,
+            "version_label": None,
+            "supersedes": None,
             "authors": extract_authors(text),
-            "metadata": lookup_metadata(metadata_map, rel),
+            "metadata": metadata,
             "sections": [],
             "passages": [],
         }
@@ -709,8 +1024,41 @@ def split_long_line(line, limit):
     return chunks
 
 
+def build_csv_passages(doc, policy):
+    """One passage per CSV/TSV data row so a date filter can act per row."""
+    limit = int(policy["caps"].get("passage_chars", 900))
+    rows = (doc.get("csv") or {}).get("rows") or {}
+    passages = []
+    offset = 0
+    line_no = 0
+    for raw_line in doc["text"].splitlines():
+        line_no += 1
+        body = raw_line.strip()
+        if body:
+            row = rows.get(line_no) or {}
+            leading = len(raw_line) - len(raw_line.lstrip())
+            passages.append({
+                "file": doc["file"],
+                "section": None,
+                "section_path": [],
+                "text": body[:limit],
+                "line_start": line_no,
+                "line_end": line_no,
+                "char_start": offset + leading,
+                "char_end": offset + leading + len(body),
+                "page": None,
+                "kind": "text",
+                "row_year": row.get("year"),
+                "row_date": row.get("date"),
+            })
+        offset += len(raw_line) + 1
+    return passages
+
+
 def build_passages(doc, policy):
     limit = int(policy["caps"].get("passage_chars", 900))
+    if doc["ext"] in (".csv", ".tsv") and doc.get("csv"):
+        return build_csv_passages(doc, policy)
     is_pdf = doc["ext"] in PDF_EXTS
     passages = []
     stack = []
@@ -1031,6 +1379,8 @@ def apply_doc_filters(docs, filters):
         value = filters[key]
         if norm_key(key) in SECTION_KEYS:
             continue
+        if is_year_key(key):
+            continue
         before = len(kept)
         kept = [doc for doc in kept if doc_matches(doc, key, value)]
         mode = "exact_field" if norm_key(key) in SUPPORTED_FILTER_KEYS else "best_effort_substring"
@@ -1063,6 +1413,137 @@ def section_allowed(passage, value):
         if candidate in low or fnmatch.fnmatch(low, candidate):
             return True
     return False
+
+
+def filter_docs_by_year(docs, year_filters):
+    """Apply year as a hard document constraint.
+
+    Known-year documents that do not satisfy the filter are removed whole.
+    CSV/TSV files with a date column are kept here and filtered per row later.
+    Documents with no authoritative year are kept and tagged `unknown`.
+    """
+    if not year_filters:
+        return list(docs), 0
+    specs = [value for _key, value in year_filters]
+    kept, excluded = [], 0
+    for doc in docs:
+        csv_info = doc.get("csv") or {}
+        if doc["ext"] in (".csv", ".tsv") and csv_info.get("has_date_column"):
+            kept.append(doc)
+            continue
+        if doc["years"]:
+            if years_satisfy(doc["years"], specs):
+                kept.append(doc)
+            else:
+                excluded += 1
+        else:
+            kept.append(doc)
+    return kept, excluded
+
+
+def passage_year_ok(passage, doc, specs):
+    if not specs or not doc:
+        return True
+    csv_info = doc.get("csv") or {}
+    if doc["ext"] in (".csv", ".tsv") and csv_info.get("has_date_column"):
+        row_year = passage.get("row_year")
+        if row_year is None:
+            return True
+        return years_satisfy([row_year], specs)
+    return True
+
+
+def passage_year_status(passage, doc, specs):
+    if not specs or not doc:
+        return None, None
+    csv_info = doc.get("csv") or {}
+    if doc["ext"] in (".csv", ".tsv") and csv_info.get("has_date_column"):
+        row_year = passage.get("row_year")
+        if row_year:
+            return "known", row_year
+        return "unknown", None
+    if doc["years"]:
+        for year in doc["years"]:
+            if all(year_allowed(spec, year) for spec in specs):
+                return "known", year
+        return "known", doc["years"][0]
+    return "unknown", None
+
+
+UNIT_WORDS = {
+    "mm", "um", "nm", "mg", "ml", "ul", "l", "g", "kg", "ph", "v", "rpm",
+    "min", "h", "hz", "khz", "mhz", "mol", "c", "°c", "℃", "mmoll", "mgml", "gl",
+}
+MEASURE_RE = re.compile(
+    r"(?<![\w.])(\d+(?:\.\d+)?)\s*(mM|µM|μM|uM|nM|mmol/L|mg/mL|mg|g/L|g|mL|L|%|°C|℃|V|rpm)\b")
+PH_VALUE_RE = re.compile(
+    r"(?i)\bph\s*(?:[:=]|of|was|is|to|at)?\s*(\d+(?:\.\d+)?)")
+
+
+def snippet_around(text, position, width=120):
+    start = max(0, position - 50)
+    end = min(len(text), position + width)
+    return re.sub(r"\s+", " ", text[start:end]).strip()
+
+
+def quantity_key(unit, before, after):
+    lower_unit = unit.lower()
+    match = re.match(r"[\s\-–—:=>]*([A-Za-z][A-Za-z0-9\-]{1,30})", after)
+    if match:
+        candidate = match.group(1).lower()
+        if candidate not in EN_STOP and candidate not in UNIT_WORDS:
+            return lower_unit + ":" + candidate
+    for token in reversed(ASCII_TOKEN_RE.findall(before.lower()[-100:])):
+        if token in EN_STOP or token in UNIT_WORDS or token.isdigit():
+            continue
+        return lower_unit + ":" + token
+    return lower_unit
+
+
+def extract_quantities(text):
+    found = []
+    for match in PH_VALUE_RE.finditer(text):
+        found.append(("ph", match.group(1), snippet_around(text, match.start())))
+    for match in MEASURE_RE.finditer(text):
+        unit = match.group(2)
+        before = text[max(0, match.start() - 100):match.start()]
+        after = text[match.end():match.end() + 40]
+        found.append((quantity_key(unit, before, after), match.group(1),
+                      snippet_around(text, match.start())))
+    return found
+
+
+def numeric_key(value):
+    try:
+        return (0, float(value))
+    except (TypeError, ValueError):
+        return (1, str(value))
+
+
+def detect_conflicts(query_id, hit_texts):
+    """Flag the same quantity carrying different numeric values in one query."""
+    groups = {}
+    for file, text in hit_texts:
+        for key, value, snippet in extract_quantities(text):
+            entry = groups.setdefault(key, {"values": set(), "files": set(),
+                                            "quotes": []})
+            entry["values"].add(value)
+            entry["files"].add(file)
+            if snippet and snippet not in entry["quotes"] and len(entry["quotes"]) < 6:
+                entry["quotes"].append(snippet)
+    conflicts = []
+    for key in sorted(groups):
+        entry = groups[key]
+        if len(entry["values"]) < 2:
+            continue
+        conflicts.append({
+            "query_id": query_id,
+            "quantity": key,
+            "values": sorted(entry["values"], key=numeric_key),
+            "files": sorted(entry["files"]),
+            "quotes": entry["quotes"],
+        })
+    return conflicts
 
 
 def rank_passages(passages, query_text, policy):
@@ -1380,28 +1861,75 @@ def run(args):
         errors.append("input path not found: %s" % input_dir)
         run_log.append("index: input path missing")
 
+    annotate_versions(unique_docs)
+    doc_by_file = {doc["file"]: doc for doc in unique_docs}
+
     global_filters = case.get("filters") if isinstance(case.get("filters"), dict) else {}
-    base_docs, global_applied, global_unmatched = apply_doc_filters(unique_docs, global_filters)
+    non_year_global = {key: value for key, value in global_filters.items()
+                       if not is_year_key(key) and norm_key(key) not in SECTION_KEYS}
+    base_docs, global_applied, global_unmatched = apply_doc_filters(unique_docs, non_year_global)
     run_log.append("filters: %d global applied, %d unmatched" %
                    (len(global_applied), len(global_unmatched)))
 
     hits, evidence, misses = [], [], []
+    applied_filters, conflict_groups = [], []
     coverage_queries = []
     evidence_counter = 0
     for query in queries:
         query_id = query["id"]
+        query_filters = query.get("filters") if isinstance(query.get("filters"), dict) else {}
         merged_filters = dict(global_filters)
-        merged_filters.update(query.get("filters") or {})
-        docs_q, applied, unmatched = apply_doc_filters(unique_docs, merged_filters)
-        allowed_files = set(doc["file"] for doc in docs_q)
-        candidates = [p for p in passages if p["file"] in allowed_files]
-        section_value = None
-        for key in merged_filters:
+        merged_filters.update(query_filters)
+        doc_filters = {key: value for key, value in merged_filters.items()
+                       if not is_year_key(key) and norm_key(key) not in SECTION_KEYS}
+        year_filters = [(key, value) for key, value in sorted(merged_filters.items())
+                        if is_year_key(key)]
+        year_specs = [value for _key, value in year_filters]
+        section_key, section_value = None, None
+        for key in sorted(merged_filters):
             if norm_key(key) in SECTION_KEYS:
-                section_value = merged_filters[key]
+                section_key, section_value = key, merged_filters[key]
                 break
 
+        docs_base, applied_doc, unmatched = apply_doc_filters(unique_docs, doc_filters)
+        docs_q, year_excluded = filter_docs_by_year(docs_base, year_filters)
+        allowed_files = set(doc["file"] for doc in docs_q)
+        candidates = [passage for passage in passages
+                      if passage["file"] in allowed_files
+                      and passage_year_ok(passage, doc_by_file.get(passage["file"]),
+                                          year_specs)]
+
+        for key in sorted(query_filters):
+            if is_year_key(key) or norm_key(key) in SECTION_KEYS:
+                continue
+            for item in applied_doc:
+                if item["filter"] == key:
+                    applied_filters.append({
+                        "query_id": query_id,
+                        "filter": {key: query_filters[key]},
+                        "before": item["before"],
+                        "after": item["after"],
+                        "excluded": item["before"] - item["after"],
+                    })
+                    break
+        if year_filters:
+            year_before, year_after = len(docs_base), len(docs_q)
+            for key, value in year_filters:
+                entry = {
+                    "query_id": query_id,
+                    "filter": {key: value},
+                    "before": year_before,
+                    "after": year_after,
+                    "excluded": year_excluded,
+                }
+                if year_after == 0:
+                    entry["unsatisfied_reason"] = (
+                        "no document with a satisfying year; %d document(s) with a "
+                        "mismatching known year were excluded" % year_excluded)
+                applied_filters.append(entry)
+
         query_hits = []
+        hit_texts = []
         reason = None
         detail = ""
         if not unique_docs:
@@ -1413,8 +1941,23 @@ def run(args):
         else:
             ranked = rank_passages(candidates, query["text"], policy)
             top_k = int(policy["scoring"].get("top_k", 8))
+            section_before = len(ranked)
             if section_value is not None:
-                ranked = [item for item in ranked if section_allowed(item["passage"], section_value)]
+                ranked = [item for item in ranked
+                          if section_allowed(item["passage"], section_value)]
+            section_after = len(ranked)
+            if section_key is not None:
+                entry = {
+                    "query_id": query_id,
+                    "filter": {section_key: section_value},
+                    "before": section_before,
+                    "after": section_after,
+                    "excluded": section_before - section_after,
+                }
+                if section_after == 0:
+                    entry["unsatisfied_reason"] = (
+                        "no hit under the requested section passed the score threshold")
+                applied_filters.append(entry)
             if not ranked:
                 reason = "no_passage_above_threshold"
                 if section_value is not None:
@@ -1474,8 +2017,19 @@ def run(args):
                         "confidence": confidence,
                         "evidence_id": evidence_id,
                     }
+                    doc = doc_by_file.get(passage["file"])
+                    year_status, year_value = passage_year_status(
+                        passage, doc, year_specs)
+                    if year_status:
+                        hit["year_status"] = year_status
+                        if year_value:
+                            hit["year"] = year_value
+                    if doc and doc.get("version_label"):
+                        hit["version_label"] = doc["version_label"]
+                        hit["supersedes"] = doc.get("supersedes")
                     hits.append(hit)
                     query_hits.append(hit)
+                    hit_texts.append((passage["file"], passage["text"]))
                     evidence.append({
                         "evidence_id": evidence_id,
                         "hit_id": hit_id,
@@ -1489,7 +2043,13 @@ def run(args):
                         "quote": quote,
                         "quote_sha256": sha256_bytes(quote.encode("utf-8")),
                         "confidence": confidence,
+                        "year_status": year_status,
+                        "year": year_value,
+                        "version_label": doc.get("version_label") if doc else None,
+                        "supersedes": doc.get("supersedes") if doc else None,
                     })
+        if query_hits:
+            conflict_groups.extend(detect_conflicts(query_id, hit_texts))
 
         for item in unmatched:
             misses.append({
@@ -1499,6 +2059,16 @@ def run(args):
                 "value": item.get("value"),
                 "detail": item.get("reason"),
             })
+        if docs_base and not docs_q:
+            for key, value in year_filters:
+                misses.append({
+                    "query_id": query_id,
+                    "reason": "filter_unmatched",
+                    "filter": key,
+                    "value": value,
+                    "detail": "no document with a matching year; mismatching known-year "
+                              "documents were excluded instead of relaxed",
+                })
         if reason:
             misses.append({
                 "query_id": query_id,
@@ -1511,11 +2081,13 @@ def run(args):
             "source": query["source"],
             "filters": merged_filters,
             "documents_considered": len(docs_q),
+            "documents_year_excluded": year_excluded,
             "hits": len(query_hits),
             "distinct_files": len(set(hit["file"] for hit in query_hits)),
             "top_score": query_hits[0]["score"] if query_hits else None,
             "covered": bool(query_hits),
-            "applied_filters": applied,
+            "applied_filters": [entry for entry in applied_filters
+                                if entry["query_id"] == query_id],
         })
 
     for item in global_unmatched:
@@ -1599,7 +2171,7 @@ def run(args):
         "applied_filters": global_applied,
         "unmatched_filters": global_unmatched,
         "skipped_reasons": {key: skipped_reasons[key] for key in sorted(skipped_reasons)},
-        "input_root": str(input_dir),
+        "input_root": input_dir.name or ".",
     }
 
     if not queries:
@@ -1646,6 +2218,11 @@ def run(args):
         "output_contract_fields": {},
         "files_with_hits": sorted(set(hit["file"] for hit in hits)),
     }
+    versions = [{
+        "file": doc["file"],
+        "version_label": doc.get("version_label"),
+        "supersedes": doc.get("supersedes"),
+    } for doc in unique_docs if doc.get("version_label")]
     payload = {
         "case_id": case_id,
         "status": status,
@@ -1660,6 +2237,9 @@ def run(args):
         "summary": summary,
         "skipped": skipped,
         "duplicates": duplicates,
+        "applied_filters": applied_filters,
+        "conflict_groups": conflict_groups,
+        "versions": versions,
     }
 
     output = {"case_id": case_id}
@@ -1699,7 +2279,7 @@ def run(args):
         "case_id": case_id,
         "generator": "sk_entry.py",
         "version": VERSION,
-        "input_root": str(input_dir),
+        "input_root": input_dir.name or ".",
         "files": [{
             "path": doc["file"],
             "ext": doc["ext"],
@@ -1711,6 +2291,9 @@ def run(args):
             "confidence": doc["confidence"],
             "chars": doc["chars"],
             "years": doc["years"],
+            "year_sources": doc.get("year_sources") or [],
+            "version_label": doc.get("version_label"),
+            "supersedes": doc.get("supersedes"),
             "authors": doc["authors"],
             "sections": [item["heading"] for item in doc["sections"]],
             "passages": len(doc["passages"]),
@@ -1765,6 +2348,9 @@ def emergency_result(out_file, reason, input_raw=None):
         "summary": "Run failed before retrieval; see misses.",
         "skipped": [],
         "duplicates": [],
+        "applied_filters": [],
+        "conflict_groups": [],
+        "versions": [],
     }
     output = {"case_id": case_id}
     mapping = []
