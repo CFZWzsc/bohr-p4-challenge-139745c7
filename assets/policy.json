@@ -28,7 +28,7 @@
   "filters": {
     "section_match": "case_insensitive_substring_or_glob",
     "unmatched_policy": "report_and_do_not_relax",
-    "year_sources": ["filename", "text", "metadata", "file_metadata"]
+    "year_sources": ["path", "front_matter", "meta", "html_meta", "csv_date", "metadata"]
   },
   "status": {
     "success": "all queries covered, no unmatched filter, no indexing failure",
